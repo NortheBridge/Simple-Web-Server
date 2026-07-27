@@ -81,7 +81,10 @@ namespace SimpleWeb {
           session->connection->socket->lowest_layer().set_option(option, ec);
 
           session->connection->set_timeout(config.timeout_request);
-          session->connection->socket->async_handshake(asio::ssl::stream_base::server, [this, session](const error_code &ec) {
+          // Strand-bound so the handshake completion (which cancels the
+          // timeout and arms the first read) is serialized with the
+          // timeout-close handler on the same connection.
+          session->connection->socket->async_handshake(asio::ssl::stream_base::server, bind_executor(session->connection->write_strand, [this, session](const error_code &ec) {
             session->connection->cancel_timeout();
             auto lock = session->connection->handler_runner->continue_lock();
             if(!lock)
@@ -90,7 +93,7 @@ namespace SimpleWeb {
               this->read(session);
             else if(this->on_error)
               this->on_error(session->request, ec);
-          });
+          }));
         }
         else if(this->on_error)
           this->on_error(session->request, ec);

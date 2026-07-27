@@ -4,6 +4,7 @@
 #include "asio_compatibility.hpp"
 #include "mutex.hpp"
 #include "utility.hpp"
+#include <atomic>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -82,7 +83,12 @@ namespace SimpleWeb {
           auto lock = self->session->connection->handler_runner->continue_lock();
           if(!lock)
             return;
-          asio::async_write(*self->session->connection->socket, buffer, [self](const error_code &ec, std::size_t /*bytes_transferred*/) {
+          // The completion is bound to the connection strand: the send()
+          // callbacks (including ServerBase::write's keep-alive callback,
+          // which hands the request streambuf to a new Session and re-arms
+          // read()) mutate per-connection state, so they must be serialized
+          // with every other operation on this connection.
+          asio::async_write(*self->session->connection->socket, buffer, bind_executor(self->session->connection->write_strand, [self](const error_code &ec, std::size_t /*bytes_transferred*/) {
             auto lock = self->session->connection->handler_runner->continue_lock();
             if(!lock)
               return;
@@ -113,25 +119,31 @@ namespace SimpleWeb {
                   callback(ec);
               }
             }
-          });
+          }));
         });
       }
 
       void send_on_delete(const std::function<void(const error_code &)> &callback = nullptr) noexcept {
-        auto buffer = streambuf->data();
-        auto self = this->shared_from_this(); // Keep Response instance alive through the following async_write
-        post(session->connection->write_strand, [self, buffer, callback] {
-          auto lock = self->session->connection->handler_runner->continue_lock();
-          if(!lock)
-            return;
-          asio::async_write(*self->session->connection->socket, buffer, [self, callback](const error_code &ec, std::size_t /*bytes_transferred*/) {
-            auto lock = self->session->connection->handler_runner->continue_lock();
-            if(!lock)
-              return;
-            if(callback)
-              callback(ec);
-          });
-        });
+        // Route the final buffer through the same ordered send_queue as
+        // send(): a Response destroyed while queued sends are still in
+        // flight must not start a second concurrent async_write chain on
+        // the socket (two simultaneous composed writes on one stream are
+        // undefined behavior — observed in the field as heap corruption
+        // and use-after-free crashes under SSE responses that were sent
+        // from, and dropped on, non-server threads).
+        // shared_from_this() is valid here: ServerBase::write's deleter
+        // re-wraps the raw pointer into a new shared_ptr before calling
+        // this, which rebinds the enable_shared_from_this weak reference;
+        // send_from_queue's self reference then keeps the Response alive
+        // until the queue drains.
+        std::shared_ptr<asio::streambuf> streambuf = std::move(this->streambuf);
+        this->streambuf = std::unique_ptr<asio::streambuf>(new asio::streambuf());
+        rdbuf(this->streambuf.get());
+
+        LockGuard lock(send_queue_mutex);
+        send_queue.emplace_back(std::move(streambuf), callback);
+        if(send_queue.size() == 1)
+          send_from_queue();
       }
 
     public:
@@ -143,11 +155,14 @@ namespace SimpleWeb {
       ///
       /// Use this function if you need to recursively send parts of a longer message, or when using server-sent events.
       void send(std::function<void(const error_code &)> callback = nullptr) noexcept {
+        // The streambuf swap must happen under the queue lock: send() may
+        // be called from a non-server thread (server-sent events) and race
+        // the send_on_delete path when the last foreign reference drops.
+        LockGuard lock(send_queue_mutex);
         std::shared_ptr<asio::streambuf> streambuf = std::move(this->streambuf);
         this->streambuf = std::unique_ptr<asio::streambuf>(new asio::streambuf());
         rdbuf(this->streambuf.get());
 
-        LockGuard lock(send_queue_mutex);
         send_queue.emplace_back(std::move(streambuf), std::move(callback));
         if(send_queue.size() == 1)
           send_from_queue();
@@ -202,7 +217,11 @@ namespace SimpleWeb {
       ///
       /// This is useful when implementing a HTTP/1.0-server sending content
       /// without specifying the content length.
-      bool close_connection_after_response = false;
+      ///
+      /// Atomic because handlers legitimately set it from non-server
+      /// threads while the keep-alive decision reads it on the connection
+      /// strand.
+      std::atomic<bool> close_connection_after_response {false};
     };
 
     class Content : public std::istream {
@@ -331,12 +350,14 @@ namespace SimpleWeb {
 
         timer = make_steady_timer(*socket, std::chrono::seconds(seconds));
         std::weak_ptr<Connection> self_weak(this->shared_from_this()); // To avoid keeping Connection instance alive longer than needed
-        timer->async_wait([self_weak](const error_code &ec) {
+        // Bound to the connection strand so the timeout close cannot race
+        // socket operations initiated there.
+        timer->async_wait(bind_executor(write_strand, [self_weak](const error_code &ec) {
           if(!ec) {
             if(auto self = self_weak.lock())
               self->close();
           }
-        });
+        }));
       }
 
       void cancel_timeout() noexcept {
@@ -565,8 +586,17 @@ namespace SimpleWeb {
     }
 
     void read(const std::shared_ptr<Session> &session) {
-      session->connection->set_timeout(config.timeout_request);
-      asio::async_read_until(*session->connection->socket, *session->request->streambuf, "\r\n\r\n", [this, session](const error_code &ec, std::size_t bytes_transferred) {
+      // Initiation is posted to the connection strand and every completion
+      // handler on this connection is bound to it: reads, writes, timeout
+      // arm/cancel, and the keep-alive streambuf hand-off all serialize on
+      // the strand, so no operation can observe another one's state
+      // mid-mutation regardless of which thread triggered it.
+      post(session->connection->write_strand, [this, session] {
+        auto init_lock = session->connection->handler_runner->continue_lock();
+        if(!init_lock)
+          return;
+        session->connection->set_timeout(config.timeout_request);
+        asio::async_read_until(*session->connection->socket, *session->request->streambuf, "\r\n\r\n", bind_executor(session->connection->write_strand, [this, session](const error_code &ec, std::size_t bytes_transferred) {
         auto lock = session->connection->handler_runner->continue_lock();
         if(!lock)
           return;
@@ -617,7 +647,7 @@ namespace SimpleWeb {
             }
 
             if(content_length > num_additional_bytes) {
-              asio::async_read(*session->connection->socket, session->request->content_streambuf, asio::transfer_exactly(content_length - num_additional_bytes), [this, session](const error_code &ec, std::size_t /*bytes_transferred*/) {
+              asio::async_read(*session->connection->socket, session->request->content_streambuf, asio::transfer_exactly(content_length - num_additional_bytes), bind_executor(session->connection->write_strand, [this, session](const error_code &ec, std::size_t /*bytes_transferred*/) {
                 auto lock = session->connection->handler_runner->continue_lock();
                 if(!lock)
                   return;
@@ -626,7 +656,7 @@ namespace SimpleWeb {
                   this->find_resource(session);
                 else if(this->on_error)
                   this->on_error(session->request, ec);
-              });
+              }));
             }
             else {
               this->find_resource(session);
@@ -649,11 +679,14 @@ namespace SimpleWeb {
         }
         else if(this->on_error)
           this->on_error(session->request, ec);
+        }));
       });
     }
 
     void read_chunked_transfer_encoded(const std::shared_ptr<Session> &session, const std::shared_ptr<asio::streambuf> &chunk_size_streambuf) {
-      asio::async_read_until(*session->connection->socket, *chunk_size_streambuf, "\r\n", [this, session, chunk_size_streambuf](const error_code &ec, size_t bytes_transferred) {
+      // Only ever called from strand-bound handlers; the completion is
+      // bound so recursive chunk reads stay on the connection strand.
+      asio::async_read_until(*session->connection->socket, *chunk_size_streambuf, "\r\n", bind_executor(session->connection->write_strand, [this, session, chunk_size_streambuf](const error_code &ec, size_t bytes_transferred) {
         auto lock = session->connection->handler_runner->continue_lock();
         if(!lock)
           return;
@@ -708,7 +741,7 @@ namespace SimpleWeb {
           }
 
           if(chunk_size > num_additional_bytes) {
-            asio::async_read(*session->connection->socket, session->request->content_streambuf, asio::transfer_exactly(chunk_size - num_additional_bytes), [this, session, chunk_size_streambuf, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
+            asio::async_read(*session->connection->socket, session->request->content_streambuf, asio::transfer_exactly(chunk_size - num_additional_bytes), bind_executor(session->connection->write_strand, [this, session, chunk_size_streambuf, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
               auto lock = session->connection->handler_runner->continue_lock();
               if(!lock)
                 return;
@@ -716,7 +749,7 @@ namespace SimpleWeb {
               if(!ec) {
                 // Remove "\r\n"
                 auto null_buffer = std::make_shared<asio::streambuf>(2);
-                asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2), [this, session, chunk_size_streambuf, null_buffer, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
+                asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2), bind_executor(session->connection->write_strand, [this, session, chunk_size_streambuf, null_buffer, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
                   auto lock = session->connection->handler_runner->continue_lock();
                   if(!lock)
                     return;
@@ -724,18 +757,18 @@ namespace SimpleWeb {
                     read_next(session, chunk_size_streambuf);
                   else
                     this->on_error(session->request, ec);
-                });
+                }));
               }
               else if(this->on_error)
                 this->on_error(session->request, ec);
-            });
+            }));
           }
           else if(2 + chunk_size > num_additional_bytes) { // If only end of chunk remains unread (\n or \r\n)
             // Remove "\r\n"
             if(2 + chunk_size - num_additional_bytes == 1)
               istream.get();
             auto null_buffer = std::make_shared<asio::streambuf>(2);
-            asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2 + chunk_size - num_additional_bytes), [this, session, chunk_size_streambuf, null_buffer, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
+            asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2 + chunk_size - num_additional_bytes), bind_executor(session->connection->write_strand, [this, session, chunk_size_streambuf, null_buffer, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
               auto lock = session->connection->handler_runner->continue_lock();
               if(!lock)
                 return;
@@ -743,7 +776,7 @@ namespace SimpleWeb {
                 read_next(session, chunk_size_streambuf);
               else
                 this->on_error(session->request, ec);
-            });
+            }));
           }
           else {
             // Remove "\r\n"
@@ -755,7 +788,7 @@ namespace SimpleWeb {
         }
         else if(this->on_error)
           this->on_error(session->request, ec);
-      });
+      }));
     }
 
     void find_resource(const std::shared_ptr<Session> &session) {
