@@ -31,7 +31,9 @@ namespace SimpleWeb {
         : ServerBase<HTTPS>::ServerBase(443),
 #if (defined(ASIO_STANDALONE) && ASIO_VERSION >= 101300) || BOOST_ASIO_VERSION >= 101300
           context(asio::ssl::context::tls_server) {
-      // Disabling TLS 1.0 and 1.1 (see RFC 8996)
+      // Disabling SSL 2/3 and TLS 1.0/1.1 (see RFC 8996): TLS 1.2 minimum.
+      context.set_options(asio::ssl::context::no_sslv2);
+      context.set_options(asio::ssl::context::no_sslv3);
       context.set_options(asio::ssl::context::no_tlsv1);
       context.set_options(asio::ssl::context::no_tlsv1_1);
 #else
