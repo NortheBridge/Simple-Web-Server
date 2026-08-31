@@ -458,8 +458,30 @@ namespace SimpleWeb {
           response_promise.set_exception(std::make_exception_ptr(system_error(ec)));
           *stop_future_handlers = true;
         }
-        else if(response_->content.end)
+        else if(response_->content.end) {
           response_promise.set_value(response);
+          // Stop future handlers here too, not just on the error path above.
+          // This lambda captures `response` and `response_promise` by
+          // reference and both are locals of sync_request's stack frame:
+          // satisfying the promise unblocks that frame, which then returns and
+          // destroys them, so any later invocation reads dangling references.
+          //
+          // A server-sent-event response makes that reachable rather than
+          // theoretical. On "Content-Type: text/event-stream" the reader
+          // switches to read_server_sent_event(), which invokes this callback
+          // once per event indefinitely and always with a clear error_code, so
+          // the error guard never fires. Those late invocations read the
+          // dangling `response`, get garbage streambuf sizes, take the
+          // message_size branch and call Response::close() through a freed
+          // pointer; the eventual eof invocation then calls set_exception() on
+          // a destroyed promise. Optimized builds happen to survive it, -O0
+          // does not.
+          //
+          // Streaming consumers must use the asynchronous request() overload,
+          // which owns its callback. A synchronous call can only ever hand
+          // back the first complete response anyway.
+          *stop_future_handlers = true;
+        }
       });
 
       return response_promise.get_future().get();
